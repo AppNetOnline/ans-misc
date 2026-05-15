@@ -6,10 +6,10 @@
 .DESCRIPTION
     Performs a stale-printer cleanup in the correct service stop/start order:
       1. Verify required device/RPC services are running
-      2. Stop Spooler before printer object removals
-      3. Remove matched printers (Remove-Printer + rundll32 PrintUIEntry)
-      4. Remove matched or phantom Win32_PnPEntity devices via pnputil
-      5. Remove matched or phantom Get-PnpDevice entries (PRINTENUM / SWD class)
+      2. Remove matched printers (Remove-Printer + rundll32 PrintUIEntry)
+      3. Remove matched or phantom Win32_PnPEntity devices via pnputil
+      4. Remove matched or phantom Get-PnpDevice entries (PRINTENUM / SWD class)
+      5. Stop Spooler before registry/artifact cleanup
       6. Remove matched PRINTENUM registry keys
       7. Remove matched machine-level Print\Connections registry keys
       8. Remove matched machine-level Print\Printers registry keys
@@ -247,7 +247,8 @@ $RequiredServices = @(
     'PlugPlay',
     'DeviceInstall',
     'DsmSvc',
-    'DeviceAssociationService'
+    'DeviceAssociationService',
+    'Spooler'
 )
 
 foreach ($ServiceName in $RequiredServices) {
@@ -270,15 +271,7 @@ foreach ($ServiceName in $RequiredServices) {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Stop Spooler before printer object removals
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Stopping Print Services ==='
-
-Write-CleanupLog -Level WARN -Message 'Stopping Spooler'
-Stop-Service -Name 'Spooler' -Force -ErrorAction SilentlyContinue
-
-# ---------------------------------------------------------------------------
-# 3. Remove matched printers (Win32 printer objects)
+# 2. Remove matched printers (Win32 printer objects)
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Removing Stale Printer Objects ==='
 
@@ -299,7 +292,7 @@ else {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Remove matched PnP entities (Win32_PnPEntity / pnputil)
+# 3. Remove matched PnP entities (Win32_PnPEntity / pnputil)
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Removing Stale PnP Printer Devices ==='
 
@@ -326,7 +319,7 @@ else {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Remove matched Get-PnpDevice entries (PRINTENUM / SWD class)
+# 4. Remove matched Get-PnpDevice entries (PRINTENUM / SWD class)
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Removing Stale PnpDevice Entries ==='
 
@@ -346,6 +339,14 @@ else {
         Invoke-PnpDeviceRemoval -InstanceId $device.InstanceId -DisplayName "$reason PnpDevice: $($device.FriendlyName)" | Out-Null
     }
 }
+
+# ---------------------------------------------------------------------------
+# 5. Stop Spooler before registry/artifact cleanup
+# ---------------------------------------------------------------------------
+Write-Host -ForegroundColor DarkCyan '=== Stopping Print Services ==='
+
+Write-CleanupLog -Level WARN -Message 'Stopping Spooler'
+Stop-Service -Name 'Spooler' -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
 # 6. Remove matched PRINTENUM registry keys
