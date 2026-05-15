@@ -12,11 +12,12 @@
       5. Remove matched Get-PnpDevice entries (PRINTENUM / SWD class)
       6. Remove matched PRINTENUM registry keys
       7. Remove matched machine-level Print\Connections registry keys
-      8. Mount all local user hives, remove matched Printers\Connections keys, unmount
-      9. Clear Client Side Rendering Print Provider cache (pattern + Servers)
-     10. Clear Device Metadata filesystem caches
-     11. Remove matched Chrome print preview cached destinations
-     12. Restart services
+      8. Remove matched machine-level Print\Printers registry keys
+      9. Mount all local user hives, remove matched Printers\Connections keys, unmount
+     10. Clear Client Side Rendering Print Provider cache (pattern + Servers)
+     11. Clear Device Metadata filesystem caches
+     12. Remove matched Chrome print preview cached destinations
+     13. Restart services
 .PARAMETER Patterns
     Strings to match against printer/device names, captions, port names, driver
     names, instance IDs, and registry key names. Matched against all relevant
@@ -73,6 +74,73 @@ Function Test-MatchesPattern {
     foreach ($p in $PatternList) {
         if ($Text -like "*$p*") { return $true }
     }
+    return $false
+};
+
+Function Get-RegistryItemSearchText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$RegistryItem
+    )
+
+    $textParts = @(
+        $RegistryItem.Name,
+        $RegistryItem.PSChildName
+    )
+
+    try {
+        $properties = Get-ItemProperty -Path $RegistryItem.PSPath -ErrorAction Stop
+
+        foreach ($property in $properties.PSObject.Properties) {
+            if ($property.Name -like 'PS*') { continue }
+
+            $valueText = if ($property.Value -is [array]) {
+                $property.Value -join ' '
+            }
+            else {
+                $property.Value
+            }
+
+            $textParts += "$($property.Name) $valueText"
+        }
+    }
+    catch {
+        # Some protected registry keys cannot be read. Key name matching still applies.
+    }
+
+    return ($textParts -join ' ')
+};
+
+Function Test-RegistryTreeMatchesPattern {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$PatternList
+    )
+
+    if (-not (Test-Path $Path)) { return $false }
+
+    $items = @()
+
+    try {
+        $items += Get-Item -Path $Path -ErrorAction Stop
+        $items += Get-ChildItem -Path $Path -Recurse -ErrorAction SilentlyContinue
+    }
+    catch {
+        return $false
+    }
+
+    foreach ($item in $items) {
+        $text = Get-RegistryItemSearchText -RegistryItem $item
+        if (Test-MatchesPattern -Text $text -PatternList $PatternList) {
+            return $true
+        }
+    }
+
     return $false
 };
 
@@ -198,7 +266,7 @@ $PrintEnumPath = 'HKLM:\SYSTEM\CurrentControlSet\Enum\SWD\PRINTENUM'
 if (Test-Path $PrintEnumPath) {
     $keysToRemove = Get-ChildItem -Path $PrintEnumPath -Recurse -ErrorAction SilentlyContinue |
     Where-Object {
-        $text = "$($_.Name) $($_.PSChildName)"
+        $text = Get-RegistryItemSearchText -RegistryItem $_
         Test-MatchesPattern -Text $text -PatternList $Patterns
     } |
     Sort-Object Name -Descending
@@ -231,10 +299,9 @@ Write-Host -ForegroundColor DarkCyan '=== Removing Machine-Level Print Connectio
 $MachinePrintConnectionsPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Connections'
 
 if (Test-Path $MachinePrintConnectionsPath) {
-    $machineConnectionKeysToRemove = Get-ChildItem -Path $MachinePrintConnectionsPath -Recurse -ErrorAction SilentlyContinue |
+    $machineConnectionKeysToRemove = Get-ChildItem -Path $MachinePrintConnectionsPath -ErrorAction SilentlyContinue |
     Where-Object {
-        $text = "$($_.Name) $($_.PSChildName)"
-        Test-MatchesPattern -Text $text -PatternList $Patterns
+        Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns
     } |
     Sort-Object Name -Descending
 
@@ -259,7 +326,41 @@ else {
 }
 
 # ---------------------------------------------------------------------------
-# 8. Mount all local user hives, clean Printers\Connections, unmount
+# 8. Remove matched machine-level Print\Printers registry keys
+# ---------------------------------------------------------------------------
+Write-Host -ForegroundColor DarkCyan '=== Removing Machine-Level Printer Registry Keys ==='
+
+$MachinePrintPrintersPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers'
+
+if (Test-Path $MachinePrintPrintersPath) {
+    $machinePrinterKeysToRemove = Get-ChildItem -Path $MachinePrintPrintersPath -ErrorAction SilentlyContinue |
+    Where-Object {
+        Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns
+    } |
+    Sort-Object Name -Descending
+
+    if (-not $machinePrinterKeysToRemove) {
+        Write-CleanupLog -Level INFO -Message 'No matching machine-level Print\Printers keys found.'
+    }
+    else {
+        foreach ($key in $machinePrinterKeysToRemove) {
+            Write-CleanupLog -Level WARN -Message "Removing machine-level Print\Printers key: $($key.Name)"
+            try {
+                Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
+                Write-CleanupLog -Level SUCCESS -Message "Removed: $($key.Name)"
+            }
+            catch {
+                Write-CleanupLog -Level ERROR -Message "Failed to remove $($key.Name): $($_.Exception.Message)"
+            }
+        }
+    }
+}
+else {
+    Write-CleanupLog -Level INFO -Message 'Machine-level Print\Printers path not found — skipping.'
+}
+
+# ---------------------------------------------------------------------------
+# 9. Mount all local user hives, clean Printers\Connections, unmount
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Cleaning User-Hive Printer Connection Keys ==='
 
@@ -308,8 +409,7 @@ foreach ($profile in $UserProfiles) {
     if (Test-Path $connectionsPath) {
         $keysToRemove = Get-ChildItem -Path $connectionsPath -ErrorAction SilentlyContinue |
         Where-Object {
-            $text = "$($_.Name) $($_.PSChildName)"
-            Test-MatchesPattern -Text $text -PatternList $Patterns
+            Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns
         }
 
         if (-not $keysToRemove) {
@@ -341,7 +441,7 @@ foreach ($profile in $UserProfiles) {
 }
 
 # ---------------------------------------------------------------------------
-# 9. Clear Client Side Rendering Print Provider cache
+# 10. Clear Client Side Rendering Print Provider cache
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Clearing CSR Print Provider Cache ==='
 
@@ -350,7 +450,7 @@ $CsrBase = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\C
 if (Test-Path $CsrBase) {
     $csrMatched = Get-ChildItem -Path $CsrBase -Recurse -ErrorAction SilentlyContinue |
     Where-Object {
-        $text = "$($_.Name) $($_.PSChildName)"
+        $text = Get-RegistryItemSearchText -RegistryItem $_
         Test-MatchesPattern -Text $text -PatternList $Patterns
     } |
     Sort-Object Name -Descending
@@ -383,7 +483,7 @@ else {
 }
 
 # ---------------------------------------------------------------------------
-# 10. Clear Device Metadata filesystem caches
+# 11. Clear Device Metadata filesystem caches
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Clearing Device Metadata Cache ==='
 
@@ -398,7 +498,7 @@ foreach ($cachePath in $CachePaths) {
 }
 
 # ---------------------------------------------------------------------------
-# 11. Remove matched Chrome print preview cached destinations
+# 12. Remove matched Chrome print preview cached destinations
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Clearing Chrome Print Preview Cache ==='
 
@@ -480,7 +580,7 @@ foreach ($chromeUserProfile in $ChromeProfiles) {
 }
 
 # ---------------------------------------------------------------------------
-# 12. Restart services
+# 13. Restart services
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Restarting Services ==='
 
