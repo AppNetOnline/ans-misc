@@ -11,11 +11,12 @@
       4. Remove matched Win32_PnPEntity devices via pnputil
       5. Remove matched Get-PnpDevice entries (PRINTENUM / SWD class)
       6. Remove matched PRINTENUM registry keys
-      7. Mount all local user hives, remove matched Printers\Connections keys, unmount
-      8. Clear Client Side Rendering Print Provider cache (pattern + Servers)
-      9. Clear Device Metadata filesystem caches
-     10. Remove matched Chrome print preview cached destinations
-     11. Restart services
+      7. Remove matched machine-level Print\Connections registry keys
+      8. Mount all local user hives, remove matched Printers\Connections keys, unmount
+      9. Clear Client Side Rendering Print Provider cache (pattern + Servers)
+     10. Clear Device Metadata filesystem caches
+     11. Remove matched Chrome print preview cached destinations
+     12. Restart services
 .PARAMETER Patterns
     Strings to match against printer/device names, captions, port names, driver
     names, instance IDs, and registry key names. Matched against all relevant
@@ -223,7 +224,42 @@ else {
 }
 
 # ---------------------------------------------------------------------------
-# 7. Mount all local user hives, clean Printers\Connections, unmount
+# 7. Remove matched machine-level Print\Connections registry keys
+# ---------------------------------------------------------------------------
+Write-Host -ForegroundColor DarkCyan '=== Removing Machine-Level Print Connection Registry Keys ==='
+
+$MachinePrintConnectionsPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Connections'
+
+if (Test-Path $MachinePrintConnectionsPath) {
+    $machineConnectionKeysToRemove = Get-ChildItem -Path $MachinePrintConnectionsPath -Recurse -ErrorAction SilentlyContinue |
+    Where-Object {
+        $text = "$($_.Name) $($_.PSChildName)"
+        Test-MatchesPattern -Text $text -PatternList $Patterns
+    } |
+    Sort-Object Name -Descending
+
+    if (-not $machineConnectionKeysToRemove) {
+        Write-CleanupLog -Level INFO -Message 'No matching machine-level Print\Connections keys found.'
+    }
+    else {
+        foreach ($key in $machineConnectionKeysToRemove) {
+            Write-CleanupLog -Level WARN -Message "Removing machine-level Print\Connections key: $($key.Name)"
+            try {
+                Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
+                Write-CleanupLog -Level SUCCESS -Message "Removed: $($key.Name)"
+            }
+            catch {
+                Write-CleanupLog -Level ERROR -Message "Failed to remove $($key.Name): $($_.Exception.Message)"
+            }
+        }
+    }
+}
+else {
+    Write-CleanupLog -Level INFO -Message 'Machine-level Print\Connections path not found — skipping.'
+}
+
+# ---------------------------------------------------------------------------
+# 8. Mount all local user hives, clean Printers\Connections, unmount
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Cleaning User-Hive Printer Connection Keys ==='
 
@@ -305,7 +341,7 @@ foreach ($profile in $UserProfiles) {
 }
 
 # ---------------------------------------------------------------------------
-# 8. Clear Client Side Rendering Print Provider cache
+# 9. Clear Client Side Rendering Print Provider cache
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Clearing CSR Print Provider Cache ==='
 
@@ -347,7 +383,7 @@ else {
 }
 
 # ---------------------------------------------------------------------------
-# 9. Clear Device Metadata filesystem caches
+# 10. Clear Device Metadata filesystem caches
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Clearing Device Metadata Cache ==='
 
@@ -362,7 +398,7 @@ foreach ($cachePath in $CachePaths) {
 }
 
 # ---------------------------------------------------------------------------
-# 10. Remove matched Chrome print preview cached destinations
+# 11. Remove matched Chrome print preview cached destinations
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Clearing Chrome Print Preview Cache ==='
 
@@ -444,7 +480,7 @@ foreach ($chromeUserProfile in $ChromeProfiles) {
 }
 
 # ---------------------------------------------------------------------------
-# 11. Restart services
+# 12. Restart services
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Restarting Services ==='
 
