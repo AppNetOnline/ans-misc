@@ -6,7 +6,7 @@
 .DESCRIPTION
     Performs a stale-printer cleanup in the correct service stop/start order:
       1. Verify required device/RPC services are running
-      2. Stop Spooler + DeviceAssociationService
+      2. Stop Spooler before printer object removals
       3. Remove matched printers (Remove-Printer + rundll32 PrintUIEntry)
       4. Remove matched Win32_PnPEntity devices via pnputil
       5. Remove matched Get-PnpDevice entries (PRINTENUM / SWD class)
@@ -144,6 +144,63 @@ Function Test-RegistryTreeMatchesPattern {
     return $false
 };
 
+Function Remove-RegistryKeyIfPresent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName
+    )
+
+    if (-not (Test-Path $Path)) {
+        Write-CleanupLog -Level INFO -Message "Already removed: $DisplayName"
+        return
+    }
+
+    try {
+        Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
+        Write-CleanupLog -Level SUCCESS -Message "Removed: $DisplayName"
+        return
+    }
+    catch {
+        if (-not (Test-Path $Path)) {
+            Write-CleanupLog -Level INFO -Message "Already removed: $DisplayName"
+            return
+        }
+
+        $registryPath = $Path -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''
+        $registryPath = $registryPath -replace '^Registry::', ''
+
+        if ($registryPath -match '^HKEY_LOCAL_MACHINE\\') {
+            $registryPath = $registryPath -replace '^HKEY_LOCAL_MACHINE\\', 'HKLM\'
+        }
+        elseif ($registryPath -match '^HKEY_USERS\\') {
+            $registryPath = $registryPath -replace '^HKEY_USERS\\', 'HKU\'
+        }
+
+        if ($registryPath -match '^(HKLM|HKU)\\') {
+            $regDelete = reg.exe delete $registryPath /f 2>&1
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-CleanupLog -Level SUCCESS -Message "Removed with reg.exe: $DisplayName"
+                return
+            }
+
+            if (-not (Test-Path $Path)) {
+                Write-CleanupLog -Level INFO -Message "Already removed: $DisplayName"
+                return
+            }
+
+            Write-CleanupLog -Level ERROR -Message "Failed to remove ${DisplayName}: $($_.Exception.Message); reg.exe: $regDelete"
+        }
+        else {
+            Write-CleanupLog -Level ERROR -Message "Failed to remove ${DisplayName}: $($_.Exception.Message)"
+        }
+    }
+};
+
 # ---------------------------------------------------------------------------
 # 1. Required services — verify and start if needed
 # ---------------------------------------------------------------------------
@@ -179,15 +236,12 @@ foreach ($ServiceName in $RequiredServices) {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Stop Spooler and DeviceAssociationService before all removals
+# 2. Stop Spooler before printer object removals
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Stopping Print Services ==='
 
 Write-CleanupLog -Level WARN -Message 'Stopping Spooler'
 Stop-Service -Name 'Spooler' -Force -ErrorAction SilentlyContinue
-
-Write-CleanupLog -Level WARN -Message 'Stopping DeviceAssociationService'
-Stop-Service -Name 'DeviceAssociationService' -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
 # 3. Remove matched printers (Win32 printer objects)
@@ -264,10 +318,9 @@ Write-Host -ForegroundColor DarkCyan '=== Removing PRINTENUM Registry Remnants =
 $PrintEnumPath = 'HKLM:\SYSTEM\CurrentControlSet\Enum\SWD\PRINTENUM'
 
 if (Test-Path $PrintEnumPath) {
-    $keysToRemove = Get-ChildItem -Path $PrintEnumPath -Recurse -ErrorAction SilentlyContinue |
+    $keysToRemove = Get-ChildItem -Path $PrintEnumPath -ErrorAction SilentlyContinue |
     Where-Object {
-        $text = Get-RegistryItemSearchText -RegistryItem $_
-        Test-MatchesPattern -Text $text -PatternList $Patterns
+        Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns
     } |
     Sort-Object Name -Descending
 
@@ -276,14 +329,12 @@ if (Test-Path $PrintEnumPath) {
     }
     else {
         foreach ($key in $keysToRemove) {
+            $instanceId = "SWD\PRINTENUM\$($key.PSChildName)"
             Write-CleanupLog -Level WARN -Message "Removing PRINTENUM key: $($key.Name)"
-            try {
-                Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
-                Write-CleanupLog -Level SUCCESS -Message "Removed: $($key.Name)"
-            }
-            catch {
-                Write-CleanupLog -Level ERROR -Message "Failed to remove $($key.Name): $($_.Exception.Message)"
-            }
+            Write-CleanupLog -Level WARN -Message "Removing PRINTENUM PnP device: $instanceId"
+            $result = pnputil.exe /remove-device $instanceId /subtree /force
+            Write-CleanupLog -Level INFO -Message "pnputil result: $result"
+            Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
         }
     }
 }
@@ -311,13 +362,7 @@ if (Test-Path $MachinePrintConnectionsPath) {
     else {
         foreach ($key in $machineConnectionKeysToRemove) {
             Write-CleanupLog -Level WARN -Message "Removing machine-level Print\Connections key: $($key.Name)"
-            try {
-                Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
-                Write-CleanupLog -Level SUCCESS -Message "Removed: $($key.Name)"
-            }
-            catch {
-                Write-CleanupLog -Level ERROR -Message "Failed to remove $($key.Name): $($_.Exception.Message)"
-            }
+            Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
         }
     }
 }
@@ -345,13 +390,7 @@ if (Test-Path $MachinePrintPrintersPath) {
     else {
         foreach ($key in $machinePrinterKeysToRemove) {
             Write-CleanupLog -Level WARN -Message "Removing machine-level Print\Printers key: $($key.Name)"
-            try {
-                Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
-                Write-CleanupLog -Level SUCCESS -Message "Removed: $($key.Name)"
-            }
-            catch {
-                Write-CleanupLog -Level ERROR -Message "Failed to remove $($key.Name): $($_.Exception.Message)"
-            }
+            Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
         }
     }
 }
@@ -418,7 +457,7 @@ foreach ($profile in $UserProfiles) {
         else {
             foreach ($key in $keysToRemove) {
                 Write-CleanupLog -Level WARN -Message "Removing connection key [$sid]: $($key.PSChildName)"
-                Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
             }
         }
     }
@@ -461,7 +500,7 @@ if (Test-Path $CsrBase) {
     else {
         foreach ($key in $csrMatched) {
             Write-CleanupLog -Level WARN -Message "Removing CSR key: $($key.Name)"
-            Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
         }
     }
 
@@ -470,7 +509,7 @@ if (Test-Path $CsrBase) {
         Get-ChildItem -Path $CsrServersPath -ErrorAction SilentlyContinue |
         ForEach-Object {
             Write-CleanupLog -Level WARN -Message "Removing CSR server key: $($_.Name)"
-            Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-RegistryKeyIfPresent -Path $_.PSPath -DisplayName $_.Name
         }
         Write-CleanupLog -Level SUCCESS -Message 'CSR Servers subkey cleared.'
     }
