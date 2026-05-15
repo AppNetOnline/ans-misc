@@ -1,244 +1,341 @@
 #Requires -RunAsAdministrator
+#Requires -Version 5.1
+
 <#
 .SYNOPSIS
-    Removes stale Windows printer objects, PnP devices, and related registry
-    artifacts that match caller-supplied patterns.
+    Removes stale Windows printer objects, PnP devices, and related registry artifacts that match caller-supplied patterns.
+
 .DESCRIPTION
-    Performs a stale-printer cleanup in the correct service stop/start order:
-      1. Verify required device/RPC services are running
-      2. Remove matched printers (Remove-Printer + rundll32 PrintUIEntry)
-      3. Remove matched or phantom Win32_PnPEntity devices via pnputil
-      4. Remove matched or phantom Get-PnpDevice entries (PRINTENUM / SWD class)
-      5. Stop Spooler before registry/artifact cleanup
-      6. Remove matched PRINTENUM registry keys
-      7. Remove matched machine-level Print\Connections registry keys
-      8. Remove matched machine-level Print\Printers registry keys
-      9. Mount all local user hives, remove matched Printers\Connections keys, unmount
-     10. Clear Client Side Rendering Print Provider cache (pattern + Servers)
-     11. Clear Device Metadata filesystem caches
-     12. Remove matched Chrome print preview cached destinations
-     13. Restart services
+    Performs stale printer cleanup in the correct service stop/start order.
+
+    Cleanup order:
+        1. Verify required device, RPC, and print services are running.
+        2. Remove matched printers with Remove-Printer and PrintUIEntry.
+        3. Remove matched or phantom Win32_PnPEntity printer devices with pnputil.
+        4. Remove matched or phantom Get-PnpDevice printer entries.
+        5. Stop the Print Spooler before registry and filesystem cleanup.
+        6. Remove matched HKLM PRINTENUM registry keys.
+        7. Remove matched machine-level Print\Connections registry keys.
+        8. Remove matched machine-level Print\Printers registry keys.
+        9. Mount local user hives, remove matched Printers\Connections keys, and unmount.
+       10. Clear Client Side Rendering Print Provider cache.
+       11. Clear Device Metadata filesystem caches.
+       12. Remove matched Chrome print preview cached destinations.
+       13. Restart services.
+
 .PARAMETER Patterns
-    Strings to match against printer/device names, captions, port names, driver
-    names, instance IDs, and registry key names. Matched against all relevant
-    fields using -like wildcard comparison.
+    Strings to match against printer names, device names, captions, port names, driver names,
+    instance IDs, and registry key/property values.
+
 .PARAMETER LogDirectory
     Directory where the cleanup log should be written.
+
 .EXAMPLE
-    .\Remove-StaleServerPrinters.ps1 -Patterns "OLD-PRINT01","\\OLD-PRINT01"
+    .\Remove-StaleServerPrinters.ps1 -Patterns 'OLD-PRINT01', '\\OLD-PRINT01';
+
 .EXAMPLE
-    .\Remove-StaleServerPrinters.ps1 -Patterns "OLD-PRINT01","OLD-PRINT01.contoso.com","Front Desk"
+    .\Remove-StaleServerPrinters.ps1 -Patterns 'OLD-PRINT01', 'OLD-PRINT01.contoso.com', 'Front Desk';
+
 .NOTES
     Updated: 2026-05-15
 #>
-[CmdletBinding(SupportsShouldProcess)]
-param(
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string[]]$Patterns,
 
-    [Parameter(Mandatory = $false)]
+[CmdletBinding(SupportsShouldProcess = $True)]
+Param(
+    [Parameter(
+        Mandatory = $True
+    )]
     [ValidateNotNullOrEmpty()]
-    [string]$LogDirectory = "$env:ProgramData\PrinterCleanup"
+    [String[]]
+    $Patterns,
+
+    [Parameter(
+        Mandatory = $False
+    )]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $LogDirectory = "$env:ProgramData\PrinterCleanup"
 )
 
-# ---------------------------------------------------------------------------
-# Logging helper
-# ---------------------------------------------------------------------------
-New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
-$LogPath = Join-Path -Path $LogDirectory -ChildPath 'Remove-StaleServerPrinters.log'
+Set-StrictMode -Version Latest;
+$ErrorActionPreference = 'Stop';
+
+#region Initialize Logging
+
+New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null;
+
+$LogPath = Join-Path -Path $LogDirectory -ChildPath 'Remove-StaleServerPrinters.log';
+
+#endregion Initialize Logging
+
+#region Functions
 
 Function Write-CleanupLog {
     [CmdletBinding()]
-    param(
-        [string]$Message,
+    Param(
+        [Parameter(
+            Mandatory = $True
+        )]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Message,
+
+        [Parameter(
+            Mandatory = $False
+        )]
         [ValidateSet('INFO', 'SUCCESS', 'WARN', 'ERROR')]
-        [string]$Level = 'INFO'
+        [String]
+        $Level = 'INFO'
     )
-    $entry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
-    Add-Content -Path $LogPath -Value $entry -ErrorAction SilentlyContinue
-    switch ($Level) {
-        'INFO' { Write-Host -ForegroundColor DarkGray  "[i] $Message" }
-        'SUCCESS' { Write-Host -ForegroundColor Green     "[+] $Message" }
-        'WARN' { Write-Host -ForegroundColor Yellow    "[!] $Message" }
-        'ERROR' { Write-Host -ForegroundColor Red       "[X] $Message" }
+
+    $Entry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message";
+
+    Add-Content -Path $LogPath -Value $Entry -ErrorAction SilentlyContinue;
+
+    Switch ($Level) {
+        'INFO' {
+            Write-Host -ForegroundColor DarkGray "[i] $Message";
+        }
+
+        'SUCCESS' {
+            Write-Host -ForegroundColor Green "[+] $Message";
+        }
+
+        'WARN' {
+            Write-Host -ForegroundColor Yellow "[!] $Message";
+        }
+
+        'ERROR' {
+            Write-Host -ForegroundColor Red "[X] $Message";
+        }
     }
-};
+}
 
 Function Test-MatchesPattern {
     [CmdletBinding()]
-    param(
-        [string]$Text,
-        [string[]]$PatternList
+    Param(
+        [Parameter(
+            Mandatory = $False
+        )]
+        [AllowNull()]
+        [String]
+        $Text,
+
+        [Parameter(
+            Mandatory = $True
+        )]
+        [ValidateNotNullOrEmpty()]
+        [String[]]
+        $PatternList
     )
-    foreach ($p in $PatternList) {
-        if ($Text -like "*$p*") { return $true }
-    }
-    return $false
-};
+
+    If ([String]::IsNullOrWhiteSpace($Text)) {
+        Return $False;
+    };
+
+    ForEach ($Pattern in $PatternList) {
+        If ($Text -like "*$Pattern*") {
+            Return $True;
+        };
+    };
+
+    Return $False;
+}
 
 Function Get-RegistryItemSearchText {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$RegistryItem
+    Param(
+        [Parameter(Mandatory = $True)]
+        [Object]$RegistryItem
     )
 
-    $textParts = @(
+    $TextParts = @(
         $RegistryItem.Name,
         $RegistryItem.PSChildName
-    )
+    );
 
-    try {
-        $properties = Get-ItemProperty -Path $RegistryItem.PSPath -ErrorAction Stop
+    Try {
+        $Properties = Get-ItemProperty -Path $RegistryItem.PSPath -ErrorAction Stop;
 
-        foreach ($property in $properties.PSObject.Properties) {
-            if ($property.Name -like 'PS*') { continue }
-
-            $valueText = if ($property.Value -is [array]) {
-                $property.Value -join ' '
-            }
-            else {
-                $property.Value
+        ForEach ($Property in $Properties.PSObject.Properties) {
+            If ($Property.Name -like 'PS*') {
+                Continue;
             }
 
-            $textParts += "$($property.Name) $valueText"
+            If ($Property.Value -is [Array]) {
+                $ValueText = $Property.Value -join ' ';
+            }
+            Else {
+                $ValueText = $Property.Value;
+            }
+
+            $TextParts += "$($Property.Name) $ValueText";
         }
     }
-    catch {
-        # Some protected registry keys cannot be read. Key name matching still applies.
+    Catch {
+        # Some protected registry keys cannot be read. Key-name matching still applies.
     }
 
-    return ($textParts -join ' ')
+    Return ($TextParts -join ' ');
 };
 
 Function Test-RegistryTreeMatchesPattern {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
+    Param(
+        [Parameter(
+            Mandatory = $True
+        )]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Path,
 
-        [Parameter(Mandatory = $true)]
-        [string[]]$PatternList
+        [Parameter(
+            Mandatory = $True
+        )]
+        [ValidateNotNullOrEmpty()]
+        [String[]]
+        $PatternList
     )
 
-    if (-not (Test-Path $Path)) { return $false }
+    If (-not (Test-Path -Path $Path)) {
+        Return $False;
+    };
 
-    $items = @()
+    $Items = @();
 
-    try {
-        $items += Get-Item -Path $Path -ErrorAction Stop
-        $items += Get-ChildItem -Path $Path -Recurse -ErrorAction SilentlyContinue
+    Try {
+        $Items += Get-Item -Path $Path -ErrorAction Stop;
+        $Items += Get-ChildItem -Path $Path -Recurse -ErrorAction SilentlyContinue;
     }
-    catch {
-        return $false
-    }
-
-    foreach ($item in $items) {
-        $text = Get-RegistryItemSearchText -RegistryItem $item
-        if (Test-MatchesPattern -Text $text -PatternList $PatternList) {
-            return $true
-        }
+    Catch {
+        Return $False;
     }
 
-    return $false
+    ForEach ($Item in $Items) {
+        $Text = Get-RegistryItemSearchText -RegistryItem $Item;
+
+        If (Test-MatchesPattern -Text $Text -PatternList $PatternList) {
+            Return $True;
+        };
+    };
+
+    Return $False;
 };
 
 Function Remove-RegistryKeyIfPresent {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
+    Param(
+        [Parameter(
+            Mandatory = $True
+        )]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Path,
 
-        [Parameter(Mandatory = $true)]
-        [string]$DisplayName
+        [Parameter(
+            Mandatory = $True
+        )]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $DisplayName
     )
 
-    if (-not (Test-Path $Path)) {
-        Write-CleanupLog -Level INFO -Message "Already removed: $DisplayName"
-        return
+    If (-not (Test-Path -Path $Path)) {
+        Write-CleanupLog -Level INFO -Message "Already removed: $DisplayName";
+        Return;
+    };
+
+    Try {
+        Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop;
+
+        Write-CleanupLog -Level SUCCESS -Message "Removed: $DisplayName";
+
+        Return;
     }
+    Catch {
+        If (-not (Test-Path -Path $Path)) {
+            Write-CleanupLog -Level INFO -Message "Already removed: $DisplayName";
+            Return;
+        };
 
-    try {
-        Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
-        Write-CleanupLog -Level SUCCESS -Message "Removed: $DisplayName"
-        return
-    }
-    catch {
-        if (-not (Test-Path $Path)) {
-            Write-CleanupLog -Level INFO -Message "Already removed: $DisplayName"
-            return
+        $RegistryPath = $Path -replace '^Microsoft\.PowerShell\.Core\\Registry::', '';
+        $RegistryPath = $RegistryPath -replace '^Registry::', '';
+
+        If ($RegistryPath -match '^HKEY_LOCAL_MACHINE\\') {
+            $RegistryPath = $RegistryPath -replace '^HKEY_LOCAL_MACHINE\\', 'HKLM\';
+        }
+        ElseIf ($RegistryPath -match '^HKEY_USERS\\') {
+            $RegistryPath = $RegistryPath -replace '^HKEY_USERS\\', 'HKU\';
         }
 
-        $registryPath = $Path -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''
-        $registryPath = $registryPath -replace '^Registry::', ''
+        If ($RegistryPath -match '^(HKLM|HKU)\\') {
+            $RegDelete = reg.exe delete $RegistryPath /f 2>&1;
 
-        if ($registryPath -match '^HKEY_LOCAL_MACHINE\\') {
-            $registryPath = $registryPath -replace '^HKEY_LOCAL_MACHINE\\', 'HKLM\'
+            If ($LASTEXITCODE -eq 0) {
+                Write-CleanupLog -Level SUCCESS -Message "Removed with reg.exe: $DisplayName";
+                Return;
+            };
+
+            If (-not (Test-Path -Path $Path)) {
+                Write-CleanupLog -Level INFO -Message "Already removed: $DisplayName";
+                Return;
+            };
+
+            Write-CleanupLog -Level ERROR -Message "Failed to remove ${DisplayName}: $($_.Exception.Message); reg.exe: $RegDelete";
         }
-        elseif ($registryPath -match '^HKEY_USERS\\') {
-            $registryPath = $registryPath -replace '^HKEY_USERS\\', 'HKU\'
-        }
-
-        if ($registryPath -match '^(HKLM|HKU)\\') {
-            $regDelete = reg.exe delete $registryPath /f 2>&1
-
-            if ($LASTEXITCODE -eq 0) {
-                Write-CleanupLog -Level SUCCESS -Message "Removed with reg.exe: $DisplayName"
-                return
-            }
-
-            if (-not (Test-Path $Path)) {
-                Write-CleanupLog -Level INFO -Message "Already removed: $DisplayName"
-                return
-            }
-
-            Write-CleanupLog -Level ERROR -Message "Failed to remove ${DisplayName}: $($_.Exception.Message); reg.exe: $regDelete"
-        }
-        else {
-            Write-CleanupLog -Level ERROR -Message "Failed to remove ${DisplayName}: $($_.Exception.Message)"
+        Else {
+            Write-CleanupLog -Level ERROR -Message "Failed to remove ${DisplayName}: $($_.Exception.Message)";
         }
     }
 };
 
 Function Invoke-PnpDeviceRemoval {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$InstanceId,
+    Param(
+        [Parameter(
+            Mandatory = $True
+        )]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $InstanceId,
 
-        [Parameter(Mandatory = $false)]
-        [string]$DisplayName = $InstanceId
+        [Parameter(
+            Mandatory = $False
+        )]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $DisplayName = $InstanceId
     )
 
-    Write-CleanupLog -Level WARN -Message "Removing PnP device: $DisplayName [$InstanceId]"
+    Write-CleanupLog -Level WARN -Message "Removing PnP device: $DisplayName [$InstanceId]";
 
-    try {
-        $result = & pnputil.exe /remove-device $InstanceId /subtree /force 2>&1 | Out-String
-        $result = $result.Trim()
+    Try {
+        $Result = & pnputil.exe /remove-device $InstanceId /subtree /force 2>&1 | Out-String;
+        $Result = $Result.Trim();
 
-        if ($result) {
-            Write-CleanupLog -Level INFO -Message "pnputil result: $result"
-        }
+        If ($Result) {
+            Write-CleanupLog -Level INFO -Message "pnputil result: $Result";
+        };
 
-        if ($LASTEXITCODE -eq 0) {
-            Write-CleanupLog -Level SUCCESS -Message "pnputil removed device: $InstanceId"
-            return $true
-        }
+        If ($LASTEXITCODE -eq 0) {
+            Write-CleanupLog -Level SUCCESS -Message "pnputil removed device: $InstanceId";
+            Return $True;
+        };
 
-        Write-CleanupLog -Level WARN -Message "pnputil exit code $LASTEXITCODE for $InstanceId"
+        Write-CleanupLog -Level WARN -Message "pnputil exit code $LASTEXITCODE for $InstanceId";
     }
-    catch {
-        Write-CleanupLog -Level WARN -Message "pnputil failed for ${InstanceId}: $($_.Exception.Message)"
+    Catch {
+        Write-CleanupLog -Level WARN -Message "pnputil failed for ${InstanceId}: $($_.Exception.Message)";
     }
 
-    return $false
+    Return $False;
 };
 
-# ---------------------------------------------------------------------------
-# 1. Required services — verify and start if needed
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Verifying Required Services ==='
+#endregion Functions
+
+#region Verify Required Services
+
+Write-Host -ForegroundColor DarkCyan '=== Verifying Required Services ===';
 
 $RequiredServices = @(
     'RpcSs',
@@ -249,439 +346,502 @@ $RequiredServices = @(
     'DsmSvc',
     'DeviceAssociationService',
     'Spooler'
-)
+);
 
-foreach ($ServiceName in $RequiredServices) {
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if (-not $svc) {
-        Write-CleanupLog -Level WARN -Message "Service not found: $ServiceName"
-        continue
-    }
-    Write-CleanupLog -Level INFO -Message "Service $ServiceName — status: $($svc.Status)"
-    if ($svc.Status -ne 'Running') {
-        Write-CleanupLog -Level WARN -Message "Starting service: $ServiceName"
-        try {
-            Start-Service -Name $ServiceName -ErrorAction Stop
-            Write-CleanupLog -Level SUCCESS -Message "Started: $ServiceName"
-        }
-        catch {
-            Write-CleanupLog -Level ERROR -Message "Could not start ${ServiceName}: $($_.Exception.Message)"
-        }
-    }
-}
+ForEach ($ServiceName in $RequiredServices) {
+    $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue;
 
-# ---------------------------------------------------------------------------
-# 2. Remove matched printers (Win32 printer objects)
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Removing Stale Printer Objects ==='
+    If (-not $Service) {
+        Write-CleanupLog -Level WARN -Message "Service not found: $ServiceName";
+        Continue;
+    };
+
+    Write-CleanupLog -Level INFO -Message "Service $ServiceName status: $($Service.Status)";
+
+    If ($Service.Status -ne 'Running') {
+        Write-CleanupLog -Level WARN -Message "Starting service: $ServiceName";
+
+        Try {
+            Start-Service -Name $ServiceName -ErrorAction Stop;
+            Write-CleanupLog -Level SUCCESS -Message "Started: $ServiceName";
+        }
+        Catch {
+            Write-CleanupLog -Level ERROR -Message "Could not start ${ServiceName}: $($_.Exception.Message)";
+        }
+    };
+};
+
+#endregion Verify Required Services
+
+#region Remove Matched Printer Objects
+
+Write-Host -ForegroundColor DarkCyan '=== Removing Stale Printer Objects ===';
 
 $MatchedPrinters = Get-Printer -ErrorAction SilentlyContinue | Where-Object {
-    $text = "$($_.Name) $($_.ComputerName) $($_.PortName) $($_.DriverName) $($_.Description)"
-    Test-MatchesPattern -Text $text -PatternList $Patterns
-}
+    $SearchText = "$($_.Name) $($_.ComputerName) $($_.PortName) $($_.DriverName) $($_.Description)";
 
-if (-not $MatchedPrinters) {
-    Write-CleanupLog -Level INFO -Message 'No matching printer objects found.'
-}
-else {
-    foreach ($printer in $MatchedPrinters) {
-        Write-CleanupLog -Level WARN -Message "Removing printer: $($printer.Name)"
-        rundll32 printui.dll, PrintUIEntry /dn /n "$($printer.Name)"
-        Remove-Printer -Name $printer.Name -ErrorAction SilentlyContinue
-    }
-}
+    Test-MatchesPattern -Text $SearchText -PatternList $Patterns;
+};
 
-# ---------------------------------------------------------------------------
-# 3. Remove matched PnP entities (Win32_PnPEntity / pnputil)
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Removing Stale PnP Printer Devices ==='
-
-$MatchedPnpEntities = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue |
-Where-Object {
-    $text = "$($_.Name) $($_.Caption) $($_.Description) $($_.PNPDeviceID)"
-    $isPrinterDevice = ($_.PNPClass -eq 'Printer') -or ($_.PNPDeviceID -like 'SWD\PRINTENUM\*')
-    $isPhantomDevice = $_.ConfigManagerErrorCode -eq 45
-
-    (Test-MatchesPattern -Text $text -PatternList $Patterns) -or
-    ($isPrinterDevice -and $isPhantomDevice)
+If (-not $MatchedPrinters) {
+    Write-CleanupLog -Level INFO -Message 'No matching printer objects found.';
 }
+Else {
+    ForEach ($Printer in $MatchedPrinters) {
+        Write-CleanupLog -Level WARN -Message "Removing printer: $($Printer.Name)";
 
-if (-not $MatchedPnpEntities) {
-    Write-CleanupLog -Level INFO -Message 'No matching or phantom Win32_PnPEntity devices found.'
-}
-else {
-    foreach ($entity in $MatchedPnpEntities) {
-        if ($entity.PNPDeviceID) {
-            $reason = if ($entity.ConfigManagerErrorCode -eq 45) { 'phantom' } else { 'matched' }
-            Invoke-PnpDeviceRemoval -InstanceId $entity.PNPDeviceID -DisplayName "$reason PnP entity: $($entity.Name)" | Out-Null
+        Try {
+            & rundll32.exe printui.dll, PrintUIEntry /dn /n "$($Printer.Name)" 2>&1 | Out-Null;
         }
-    }
+        Catch {
+            Write-CleanupLog -Level WARN -Message "PrintUIEntry failed for $($Printer.Name): $($_.Exception.Message)";
+        }
+
+        Try {
+            Remove-Printer -Name $Printer.Name -ErrorAction Stop;
+            Write-CleanupLog -Level SUCCESS -Message "Removed printer: $($Printer.Name)";
+        }
+        Catch {
+            Write-CleanupLog -Level WARN -Message "Remove-Printer failed for $($Printer.Name): $($_.Exception.Message)";
+        }
+    };
 }
 
-# ---------------------------------------------------------------------------
-# 4. Remove matched Get-PnpDevice entries (PRINTENUM / SWD class)
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Removing Stale PnpDevice Entries ==='
+#endregion Remove Matched Printer Objects
 
-$MatchedPnpDevices = Get-PnpDevice -Class Printer -ErrorAction SilentlyContinue |
-Where-Object {
-    $text = "$($_.FriendlyName) $($_.Name) $($_.InstanceId)"
-    (Test-MatchesPattern -Text $text -PatternList $Patterns) -or
-    ($_.Problem -eq 'CM_PROB_PHANTOM')
+#region Remove Matched PnP Entities
+
+Write-Host -ForegroundColor DarkCyan '=== Removing Stale PnP Printer Devices ===';
+
+$MatchedPnpEntities = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
+    $SearchText = "$($_.Name) $($_.Caption) $($_.Description) $($_.PNPDeviceID)";
+    $IsPrinterDevice = ($_.PNPClass -eq 'Printer') -or ($_.PNPDeviceID -like 'SWD\PRINTENUM\*');
+    $IsPhantomDevice = $_.ConfigManagerErrorCode -eq 45;
+
+    (Test-MatchesPattern -Text $SearchText -PatternList $Patterns) -or ($IsPrinterDevice -and $IsPhantomDevice);
+};
+
+If (-not $MatchedPnpEntities) {
+    Write-CleanupLog -Level INFO -Message 'No matching or phantom Win32_PnPEntity devices found.';
 }
-
-if (-not $MatchedPnpDevices) {
-    Write-CleanupLog -Level INFO -Message 'No matching or phantom PnpDevice printer entries found.'
-}
-else {
-    foreach ($device in $MatchedPnpDevices) {
-        $reason = if ($device.Problem -eq 'CM_PROB_PHANTOM') { 'phantom' } else { 'matched' }
-        Invoke-PnpDeviceRemoval -InstanceId $device.InstanceId -DisplayName "$reason PnpDevice: $($device.FriendlyName)" | Out-Null
-    }
-}
-
-# ---------------------------------------------------------------------------
-# 5. Stop Spooler before registry/artifact cleanup
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Stopping Print Services ==='
-
-Write-CleanupLog -Level WARN -Message 'Stopping Spooler'
-Stop-Service -Name 'Spooler' -Force -ErrorAction SilentlyContinue
-
-# ---------------------------------------------------------------------------
-# 6. Remove matched PRINTENUM registry keys
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Removing PRINTENUM Registry Remnants ==='
-
-$PrintEnumPath = 'HKLM:\SYSTEM\CurrentControlSet\Enum\SWD\PRINTENUM'
-
-if (Test-Path $PrintEnumPath) {
-    $keysToRemove = Get-ChildItem -Path $PrintEnumPath -ErrorAction SilentlyContinue |
-    Where-Object {
-        Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns
-    } |
-    Sort-Object Name -Descending
-
-    if (-not $keysToRemove) {
-        Write-CleanupLog -Level INFO -Message 'No matching PRINTENUM keys found.'
-    }
-    else {
-        foreach ($key in $keysToRemove) {
-            $instanceId = "SWD\PRINTENUM\$($key.PSChildName)"
-            Write-CleanupLog -Level WARN -Message "Removing PRINTENUM key: $($key.Name)"
-            $removedByPnp = Invoke-PnpDeviceRemoval -InstanceId $instanceId -DisplayName 'PRINTENUM registry device'
-
-            if (-not (Test-Path $key.PSPath)) {
-                Write-CleanupLog -Level INFO -Message "PRINTENUM key removed by PnP cleanup: $($key.Name)"
-                continue
+Else {
+    ForEach ($Entity in $MatchedPnpEntities) {
+        If ($Entity.PNPDeviceID) {
+            If ($Entity.ConfigManagerErrorCode -eq 45) {
+                $Reason = 'phantom';
+            }
+            Else {
+                $Reason = 'matched';
             }
 
-            if ($removedByPnp) {
-                Write-CleanupLog -Level WARN -Message "PRINTENUM key still visible after pnputil; leaving protected Enum key for Windows to reconcile: $($key.Name)"
-                continue
+            Invoke-PnpDeviceRemoval -InstanceId $Entity.PNPDeviceID -DisplayName "$Reason PnP entity: $($Entity.Name)" | Out-Null;
+        };
+    };
+}
+
+#endregion Remove Matched PnP Entities
+
+#region Remove Matched PnpDevice Entries
+
+Write-Host -ForegroundColor DarkCyan '=== Removing Stale PnpDevice Entries ===';
+
+$MatchedPnpDevices = Get-PnpDevice -Class Printer -ErrorAction SilentlyContinue | Where-Object {
+    $SearchText = "$($_.FriendlyName) $($_.Name) $($_.InstanceId)";
+
+    (Test-MatchesPattern -Text $SearchText -PatternList $Patterns) -or ($_.Problem -eq 'CM_PROB_PHANTOM');
+};
+
+If (-not $MatchedPnpDevices) {
+    Write-CleanupLog -Level INFO -Message 'No matching or phantom PnpDevice printer entries found.';
+}
+Else {
+    ForEach ($Device in $MatchedPnpDevices) {
+        If ($Device.Problem -eq 'CM_PROB_PHANTOM') {
+            $Reason = 'phantom';
+        }
+        Else {
+            $Reason = 'matched';
+        }
+
+        Invoke-PnpDeviceRemoval -InstanceId $Device.InstanceId -DisplayName "$Reason PnpDevice: $($Device.FriendlyName)" | Out-Null;
+    };
+}
+
+#endregion Remove Matched PnpDevice Entries
+
+#region Stop Print Services
+
+Write-Host -ForegroundColor DarkCyan '=== Stopping Print Services ===';
+
+Write-CleanupLog -Level WARN -Message 'Stopping Spooler';
+
+Try {
+    Stop-Service -Name 'Spooler' -Force -ErrorAction Stop;
+    Write-CleanupLog -Level SUCCESS -Message 'Stopped Spooler';
+}
+Catch {
+    Write-CleanupLog -Level WARN -Message "Could not stop Spooler cleanly: $($_.Exception.Message)";
+}
+
+#endregion Stop Print Services
+
+#region Remove PRINTENUM Registry Remnants
+
+Write-Host -ForegroundColor DarkCyan '=== Removing PRINTENUM Registry Remnants ===';
+
+$PrintEnumPath = 'HKLM:\SYSTEM\CurrentControlSet\Enum\SWD\PRINTENUM';
+
+If (Test-Path -Path $PrintEnumPath) {
+    $KeysToRemove = Get-ChildItem -Path $PrintEnumPath -ErrorAction SilentlyContinue | Where-Object {
+        Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns;
+    } | Sort-Object -Property Name -Descending;
+
+    If (-not $KeysToRemove) {
+        Write-CleanupLog -Level INFO -Message 'No matching PRINTENUM keys found.';
+    }
+    Else {
+        ForEach ($Key in $KeysToRemove) {
+            $InstanceId = "SWD\PRINTENUM\$($Key.PSChildName)";
+
+            Write-CleanupLog -Level WARN -Message "Removing PRINTENUM key: $($Key.Name)";
+
+            $RemovedByPnp = Invoke-PnpDeviceRemoval -InstanceId $InstanceId -DisplayName 'PRINTENUM registry device';
+
+            If (-not (Test-Path -Path $Key.PSPath)) {
+                Write-CleanupLog -Level INFO -Message "PRINTENUM key removed by PnP cleanup: $($Key.Name)";
+                Continue;
+            };
+
+            If ($RemovedByPnp) {
+                Write-CleanupLog -Level WARN -Message "PRINTENUM key still visible after pnputil. Leaving protected Enum key for Windows to reconcile: $($Key.Name)";
+                Continue;
+            };
+
+            Write-CleanupLog -Level WARN -Message "pnputil did not remove PRINTENUM device. Attempting registry fallback: $($Key.Name)";
+
+            Remove-RegistryKeyIfPresent -Path $Key.PSPath -DisplayName $Key.Name;
+        };
+    }
+}
+Else {
+    Write-CleanupLog -Level INFO -Message 'PRINTENUM path not found. Skipping.';
+}
+
+#endregion Remove PRINTENUM Registry Remnants
+
+#region Remove Machine-Level Print Connection Registry Keys
+
+Write-Host -ForegroundColor DarkCyan '=== Removing Machine-Level Print Connection Registry Keys ===';
+
+$MachinePrintConnectionsPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Connections';
+
+If (Test-Path -Path $MachinePrintConnectionsPath) {
+    $MachineConnectionKeysToRemove = Get-ChildItem -Path $MachinePrintConnectionsPath -ErrorAction SilentlyContinue | Where-Object {
+        Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns;
+    } | Sort-Object -Property Name -Descending;
+
+    If (-not $MachineConnectionKeysToRemove) {
+        Write-CleanupLog -Level INFO -Message 'No matching machine-level Print\Connections keys found.';
+    }
+    Else {
+        ForEach ($Key in $MachineConnectionKeysToRemove) {
+            Write-CleanupLog -Level WARN -Message "Removing machine-level Print\Connections key: $($Key.Name)";
+
+            Remove-RegistryKeyIfPresent -Path $Key.PSPath -DisplayName $Key.Name;
+        };
+    }
+}
+Else {
+    Write-CleanupLog -Level INFO -Message 'Machine-level Print\Connections path not found. Skipping.';
+}
+
+#endregion Remove Machine-Level Print Connection Registry Keys
+
+#region Remove Machine-Level Printer Registry Keys
+
+Write-Host -ForegroundColor DarkCyan '=== Removing Machine-Level Printer Registry Keys ===';
+
+$MachinePrintPrintersPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers';
+
+If (Test-Path -Path $MachinePrintPrintersPath) {
+    $MachinePrinterKeysToRemove = Get-ChildItem -Path $MachinePrintPrintersPath -ErrorAction SilentlyContinue | Where-Object {
+        Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns;
+    } | Sort-Object -Property Name -Descending;
+
+    If (-not $MachinePrinterKeysToRemove) {
+        Write-CleanupLog -Level INFO -Message 'No matching machine-level Print\Printers keys found.';
+    }
+    Else {
+        ForEach ($Key in $MachinePrinterKeysToRemove) {
+            Write-CleanupLog -Level WARN -Message "Removing machine-level Print\Printers key: $($Key.Name)";
+
+            Remove-RegistryKeyIfPresent -Path $Key.PSPath -DisplayName $Key.Name;
+        };
+    }
+}
+Else {
+    Write-CleanupLog -Level INFO -Message 'Machine-level Print\Printers path not found. Skipping.';
+}
+
+#endregion Remove Machine-Level Printer Registry Keys
+
+#region Clean User Hive Printer Connection Keys
+
+Write-Host -ForegroundColor DarkCyan '=== Cleaning User-Hive Printer Connection Keys ===';
+
+$UserProfileListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList';
+
+$UserProfiles = Get-ChildItem -Path $UserProfileListPath -ErrorAction SilentlyContinue | Where-Object {
+    $_.PSChildName -match '^S-1-5-21-';
+} | ForEach-Object {
+    $Sid = $_.PSChildName;
+    $UserProfilePath = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath;
+
+    [PSCustomObject]@{
+        SID         = $Sid;
+        ProfilePath = $UserProfilePath;
+    };
+} | Where-Object {
+    $_.ProfilePath -and (Test-Path -Path $_.ProfilePath);
+};
+
+ForEach ($UserProfile in $UserProfiles) {
+    $Sid = $UserProfile.SID;
+    $NtUserDatPath = Join-Path -Path $UserProfile.ProfilePath -ChildPath 'NTUSER.DAT';
+    $MountKey = "HKU_TEMP_$Sid";
+    $MountPath = "Registry::HKEY_USERS\$MountKey";
+    $AlreadyLoaded = Test-Path -Path "Registry::HKEY_USERS\$Sid";
+
+    If (-not (Test-Path -Path $NtUserDatPath)) {
+        Write-CleanupLog -Level WARN -Message "NTUSER.DAT not found for $Sid. Skipping.";
+        Continue;
+    };
+
+    $HiveMounted = $False;
+
+    If (-not $AlreadyLoaded) {
+        Write-CleanupLog -Level INFO -Message "Loading hive: $NtUserDatPath to $MountKey";
+
+        $RegLoad = reg.exe load "HKEY_USERS\$MountKey" "$NtUserDatPath" 2>&1;
+
+        If ($LASTEXITCODE -ne 0) {
+            Write-CleanupLog -Level WARN -Message "Could not load hive for $Sid. It may be in use or locked. Result: $RegLoad";
+            Continue;
+        };
+
+        $HiveMounted = $True;
+    }
+    Else {
+        $MountPath = "Registry::HKEY_USERS\$Sid";
+
+        Write-CleanupLog -Level INFO -Message "Hive already loaded for $Sid. Using live path.";
+    }
+
+    $ConnectionsPath = "$MountPath\Printers\Connections";
+
+    If (Test-Path -Path $ConnectionsPath) {
+        $KeysToRemove = Get-ChildItem -Path $ConnectionsPath -ErrorAction SilentlyContinue | Where-Object {
+            Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns;
+        };
+
+        If (-not $KeysToRemove) {
+            Write-CleanupLog -Level INFO -Message "No matching connection keys for $Sid.";
+        }
+        Else {
+            ForEach ($Key in $KeysToRemove) {
+                Write-CleanupLog -Level WARN -Message "Removing connection key [$Sid]: $($Key.PSChildName)";
+
+                Remove-RegistryKeyIfPresent -Path $Key.PSPath -DisplayName $Key.Name;
             }
-
-            Write-CleanupLog -Level WARN -Message "pnputil did not remove PRINTENUM device; attempting registry fallback: $($key.Name)"
-            Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
         }
+    }
+    Else {
+        Write-CleanupLog -Level INFO -Message "No Printers\Connections key for $Sid. Skipping.";
+    }
+
+    If ($HiveMounted) {
+        [System.GC]::Collect();
+        [System.GC]::WaitForPendingFinalizers();
+
+        $RegUnload = reg.exe unload "HKEY_USERS\$MountKey" 2>&1;
+
+        If ($LASTEXITCODE -ne 0) {
+            Write-CleanupLog -Level WARN -Message "Could not unload hive for ${Sid}: $RegUnload";
+        }
+        Else {
+            Write-CleanupLog -Level INFO -Message "Unloaded hive for $Sid.";
+        }
+    };
+};
+
+#endregion Clean User Hive Printer Connection Keys
+
+#region Clear Client Side Rendering Print Provider Cache
+
+Write-Host -ForegroundColor DarkCyan '=== Clearing CSR Print Provider Cache ===';
+
+$CsrBase = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\Client Side Rendering Print Provider';
+
+If (Test-Path -Path $CsrBase) {
+    $CsrMatched = Get-ChildItem -Path $CsrBase -Recurse -ErrorAction SilentlyContinue | Where-Object {
+        $SearchText = Get-RegistryItemSearchText -RegistryItem $_;
+
+        Test-MatchesPattern -Text $SearchText -PatternList $Patterns;
+    } | Sort-Object -Property Name -Descending;
+
+    If (-not $CsrMatched) {
+        Write-CleanupLog -Level INFO -Message 'No pattern-matched CSR keys found.';
+    }
+    Else {
+        ForEach ($Key in $CsrMatched) {
+            Write-CleanupLog -Level WARN -Message "Removing CSR key: $($Key.Name)";
+
+            Remove-RegistryKeyIfPresent -Path $Key.PSPath -DisplayName $Key.Name;
+        };
+    }
+
+    $CsrServersPath = "$CsrBase\Servers";
+
+    If (Test-Path -Path $CsrServersPath) {
+        Get-ChildItem -Path $CsrServersPath -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-CleanupLog -Level WARN -Message "Removing CSR server key: $($_.Name)";
+
+            Remove-RegistryKeyIfPresent -Path $_.PSPath -DisplayName $_.Name;
+        };
+
+        Write-CleanupLog -Level SUCCESS -Message 'CSR Servers subkey cleared.';
+    }
+    Else {
+        Write-CleanupLog -Level INFO -Message 'CSR Servers subkey not found. Skipping.';
     }
 }
-else {
-    Write-CleanupLog -Level INFO -Message 'PRINTENUM path not found — skipping.'
+Else {
+    Write-CleanupLog -Level INFO -Message 'CSR Print Provider path not found. Skipping.';
 }
 
-# ---------------------------------------------------------------------------
-# 7. Remove matched machine-level Print\Connections registry keys
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Removing Machine-Level Print Connection Registry Keys ==='
+#endregion Clear Client Side Rendering Print Provider Cache
 
-$MachinePrintConnectionsPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Connections'
+#region Clear Device Metadata Cache
 
-if (Test-Path $MachinePrintConnectionsPath) {
-    $machineConnectionKeysToRemove = Get-ChildItem -Path $MachinePrintConnectionsPath -ErrorAction SilentlyContinue |
-    Where-Object {
-        Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns
-    } |
-    Sort-Object Name -Descending
-
-    if (-not $machineConnectionKeysToRemove) {
-        Write-CleanupLog -Level INFO -Message 'No matching machine-level Print\Connections keys found.'
-    }
-    else {
-        foreach ($key in $machineConnectionKeysToRemove) {
-            Write-CleanupLog -Level WARN -Message "Removing machine-level Print\Connections key: $($key.Name)"
-            Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
-        }
-    }
-}
-else {
-    Write-CleanupLog -Level INFO -Message 'Machine-level Print\Connections path not found — skipping.'
-}
-
-# ---------------------------------------------------------------------------
-# 8. Remove matched machine-level Print\Printers registry keys
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Removing Machine-Level Printer Registry Keys ==='
-
-$MachinePrintPrintersPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers'
-
-if (Test-Path $MachinePrintPrintersPath) {
-    $machinePrinterKeysToRemove = Get-ChildItem -Path $MachinePrintPrintersPath -ErrorAction SilentlyContinue |
-    Where-Object {
-        Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns
-    } |
-    Sort-Object Name -Descending
-
-    if (-not $machinePrinterKeysToRemove) {
-        Write-CleanupLog -Level INFO -Message 'No matching machine-level Print\Printers keys found.'
-    }
-    else {
-        foreach ($key in $machinePrinterKeysToRemove) {
-            Write-CleanupLog -Level WARN -Message "Removing machine-level Print\Printers key: $($key.Name)"
-            Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
-        }
-    }
-}
-else {
-    Write-CleanupLog -Level INFO -Message 'Machine-level Print\Printers path not found — skipping.'
-}
-
-# ---------------------------------------------------------------------------
-# 9. Mount all local user hives, clean Printers\Connections, unmount
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Cleaning User-Hive Printer Connection Keys ==='
-
-# Collect profile paths from the registry — works regardless of who is logged on
-$ProfileListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
-$UserProfiles = Get-ChildItem -Path $ProfileListPath -ErrorAction SilentlyContinue |
-Where-Object { $_.PSChildName -match '^S-1-5-21-' } |
-ForEach-Object {
-    $sid = $_.PSChildName
-    $profilePath = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
-    [PSCustomObject]@{ SID = $sid; ProfilePath = $profilePath }
-} |
-Where-Object { $_.ProfilePath -and (Test-Path $_.ProfilePath) }
-
-foreach ($profile in $UserProfiles) {
-    $sid = $profile.SID
-    $ntuserdatPath = Join-Path $profile.ProfilePath 'NTUSER.DAT'
-    $mountKey = "HKU_TEMP_$sid"
-    $mountPath = "Registry::HKEY_USERS\$mountKey"
-    $alreadyLoaded = Test-Path "Registry::HKEY_USERS\$sid"
-
-    if (-not (Test-Path $ntuserdatPath)) {
-        Write-CleanupLog -Level WARN -Message "NTUSER.DAT not found for $sid — skipping."
-        continue
-    }
-
-    # Mount hive only if not already loaded (e.g. active session)
-    $hiveMounted = $false
-    if (-not $alreadyLoaded) {
-        Write-CleanupLog -Level INFO -Message "Loading hive: $ntuserdatPath -> $mountKey"
-        $regLoad = reg.exe load "HKEY_USERS\$mountKey" "$ntuserdatPath" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-CleanupLog -Level WARN -Message "Could not load hive for $sid (in use or locked): $regLoad"
-            continue
-        }
-        $hiveMounted = $true
-    }
-    else {
-        # Already loaded — use the real SID path directly
-        $mountPath = "Registry::HKEY_USERS\$sid"
-        Write-CleanupLog -Level INFO -Message "Hive already loaded for $sid — using live path."
-    }
-
-    $connectionsPath = "$mountPath\Printers\Connections"
-
-    if (Test-Path $connectionsPath) {
-        $keysToRemove = Get-ChildItem -Path $connectionsPath -ErrorAction SilentlyContinue |
-        Where-Object {
-            Test-RegistryTreeMatchesPattern -Path $_.PSPath -PatternList $Patterns
-        }
-
-        if (-not $keysToRemove) {
-            Write-CleanupLog -Level INFO -Message "No matching connection keys for $sid."
-        }
-        else {
-            foreach ($key in $keysToRemove) {
-                Write-CleanupLog -Level WARN -Message "Removing connection key [$sid]: $($key.PSChildName)"
-                Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
-            }
-        }
-    }
-    else {
-        Write-CleanupLog -Level INFO -Message "No Printers\Connections key for $sid — skipping."
-    }
-
-    # Unload only hives we mounted (never unload an active session)
-    if ($hiveMounted) {
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
-        $regUnload = reg.exe unload "HKEY_USERS\$mountKey" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-CleanupLog -Level WARN -Message "Could not unload hive for ${sid}: $regUnload"
-        }
-        else {
-            Write-CleanupLog -Level INFO -Message "Unloaded hive for $sid."
-        }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# 10. Clear Client Side Rendering Print Provider cache
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Clearing CSR Print Provider Cache ==='
-
-$CsrBase = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Providers\Client Side Rendering Print Provider'
-
-if (Test-Path $CsrBase) {
-    $csrMatched = Get-ChildItem -Path $CsrBase -Recurse -ErrorAction SilentlyContinue |
-    Where-Object {
-        $text = Get-RegistryItemSearchText -RegistryItem $_
-        Test-MatchesPattern -Text $text -PatternList $Patterns
-    } |
-    Sort-Object Name -Descending
-
-    if (-not $csrMatched) {
-        Write-CleanupLog -Level INFO -Message 'No pattern-matched CSR keys found.'
-    }
-    else {
-        foreach ($key in $csrMatched) {
-            Write-CleanupLog -Level WARN -Message "Removing CSR key: $($key.Name)"
-            Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
-        }
-    }
-
-    $CsrServersPath = "$CsrBase\Servers"
-    if (Test-Path $CsrServersPath) {
-        Get-ChildItem -Path $CsrServersPath -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            Write-CleanupLog -Level WARN -Message "Removing CSR server key: $($_.Name)"
-            Remove-RegistryKeyIfPresent -Path $_.PSPath -DisplayName $_.Name
-        }
-        Write-CleanupLog -Level SUCCESS -Message 'CSR Servers subkey cleared.'
-    }
-    else {
-        Write-CleanupLog -Level INFO -Message 'CSR Servers subkey not found — skipping.'
-    }
-}
-else {
-    Write-CleanupLog -Level INFO -Message 'CSR Print Provider path not found — skipping.'
-}
-
-# ---------------------------------------------------------------------------
-# 11. Clear Device Metadata filesystem caches
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Clearing Device Metadata Cache ==='
+Write-Host -ForegroundColor DarkCyan '=== Clearing Device Metadata Cache ===';
 
 $CachePaths = @(
     "$env:LOCALAPPDATA\Microsoft\Device Metadata\dmrccache\*",
     'C:\ProgramData\Microsoft\Windows\DeviceMetadataCache\*'
-)
+);
 
-foreach ($cachePath in $CachePaths) {
-    Write-CleanupLog -Level INFO -Message "Clearing: $cachePath"
-    Remove-Item -Path $cachePath -Recurse -Force -ErrorAction SilentlyContinue
-}
+ForEach ($CachePath in $CachePaths) {
+    Write-CleanupLog -Level INFO -Message "Clearing: $CachePath";
 
-# ---------------------------------------------------------------------------
-# 12. Remove matched Chrome print preview cached destinations
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Clearing Chrome Print Preview Cache ==='
+    Remove-Item -Path $CachePath -Recurse -Force -ErrorAction SilentlyContinue;
+};
 
-$ChromeProfiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
-Where-Object {
+#endregion Clear Device Metadata Cache
+
+#region Clear Chrome Print Preview Cache
+
+Write-Host -ForegroundColor DarkCyan '=== Clearing Chrome Print Preview Cache ===';
+
+$ChromeProfiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object {
     (-not $_.Special) -and
     $_.LocalPath -and
-    ($_.LocalPath -like 'C:\Users\*')
-}
+    ($_.LocalPath -like 'C:\Users\*');
+};
 
-foreach ($chromeUserProfile in $ChromeProfiles) {
-    $userPath = $chromeUserProfile.LocalPath
-    $chromeRoot = Join-Path -Path $userPath -ChildPath 'AppData\Local\Google\Chrome\User Data'
+ForEach ($ChromeUserProfile in $ChromeProfiles) {
+    $UserPath = $ChromeUserProfile.LocalPath;
+    $ChromeRoot = Join-Path -Path $UserPath -ChildPath 'AppData\Local\Google\Chrome\User Data';
 
-    if (-not (Test-Path $chromeRoot)) {
-        Write-CleanupLog -Level INFO -Message "Chrome profile root not found for $userPath — skipping."
-        continue
-    }
+    If (-not (Test-Path -Path $ChromeRoot)) {
+        Write-CleanupLog -Level INFO -Message "Chrome profile root not found for $UserPath. Skipping.";
+        Continue;
+    };
 
-    $chromeProfileDirs = Get-ChildItem -Path $chromeRoot -Directory -ErrorAction SilentlyContinue |
-    Where-Object {
-        Test-Path (Join-Path -Path $_.FullName -ChildPath 'Preferences')
-    }
+    $ChromeProfileDirs = Get-ChildItem -Path $ChromeRoot -Directory -ErrorAction SilentlyContinue | Where-Object {
+        Test-Path -Path (Join-Path -Path $_.FullName -ChildPath 'Preferences');
+    };
 
-    if (-not $chromeProfileDirs) {
-        Write-CleanupLog -Level INFO -Message "No Chrome Preferences files found for $userPath."
-        continue
-    }
+    If (-not $ChromeProfileDirs) {
+        Write-CleanupLog -Level INFO -Message "No Chrome Preferences files found for $UserPath.";
+        Continue;
+    };
 
-    foreach ($chromeProfileDir in $chromeProfileDirs) {
-        $prefPath = Join-Path -Path $chromeProfileDir.FullName -ChildPath 'Preferences'
+    ForEach ($ChromeProfileDir in $ChromeProfileDirs) {
+        $PrefPath = Join-Path -Path $ChromeProfileDir.FullName -ChildPath 'Preferences';
 
-        try {
-            $prefs = Get-Content -Path $prefPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            $sticky = $prefs.printing.print_preview_sticky_settings.appState
+        Try {
+            $Prefs = Get-Content -Path $PrefPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop;
+            $Sticky = $Prefs.printing.print_preview_sticky_settings.appState;
 
-            if (-not $sticky) {
-                Write-CleanupLog -Level INFO -Message "No Chrome print preview cache in $prefPath."
-                continue
-            }
+            If (-not $Sticky) {
+                Write-CleanupLog -Level INFO -Message "No Chrome print preview cache in $PrefPath.";
+                Continue;
+            };
 
-            $appState = $sticky | ConvertFrom-Json -ErrorAction Stop
+            $AppState = $Sticky | ConvertFrom-Json -ErrorAction Stop;
 
-            if (-not $appState.recentDestinations) {
-                Write-CleanupLog -Level INFO -Message "No Chrome recent print destinations in $prefPath."
-                continue
-            }
+            If (-not $AppState.recentDestinations) {
+                Write-CleanupLog -Level INFO -Message "No Chrome recent print destinations in $PrefPath.";
+                Continue;
+            };
 
-            $before = @($appState.recentDestinations).Count
-            $appState.recentDestinations = @(
-                $appState.recentDestinations | Where-Object {
-                    $text = "$($_.id) $($_.displayName)"
-                    -not (Test-MatchesPattern -Text $text -PatternList $Patterns)
-                }
-            )
-            $after = @($appState.recentDestinations).Count
-            $removed = $before - $after
+            $Before = @($AppState.recentDestinations).Count;
 
-            if ($removed -le 0) {
-                Write-CleanupLog -Level INFO -Message "No matched Chrome print destinations in $prefPath."
-                continue
-            }
+            $AppState.recentDestinations = @(
+                $AppState.recentDestinations | Where-Object {
+                    $SearchText = "$($_.id) $($_.displayName)";
 
-            Copy-Item -Path $prefPath -Destination "$prefPath.bak" -Force -ErrorAction Stop
+                    -not (Test-MatchesPattern -Text $SearchText -PatternList $Patterns);
+                };
+            );
 
-            $prefs.printing.print_preview_sticky_settings.appState =
-            ($appState | ConvertTo-Json -Depth 20 -Compress)
+            $After = @($AppState.recentDestinations).Count;
+            $Removed = $Before - $After;
 
-            $prefs |
-            ConvertTo-Json -Depth 100 -Compress |
-            Set-Content -Path $prefPath -Encoding UTF8 -ErrorAction Stop
+            If ($Removed -le 0) {
+                Write-CleanupLog -Level INFO -Message "No matched Chrome print destinations in $PrefPath.";
+                Continue;
+            };
 
-            Write-CleanupLog -Level SUCCESS -Message "Removed $removed Chrome print destination(s): $prefPath"
+            Copy-Item -Path $PrefPath -Destination "$PrefPath.bak" -Force -ErrorAction Stop;
+
+            $Prefs.printing.print_preview_sticky_settings.appState = $AppState | ConvertTo-Json -Depth 20 -Compress;
+
+            $Prefs | ConvertTo-Json -Depth 100 -Compress | Set-Content -Path $PrefPath -Encoding UTF8 -ErrorAction Stop;
+
+            Write-CleanupLog -Level SUCCESS -Message "Removed $Removed Chrome print destination(s): $PrefPath";
         }
-        catch {
-            Write-CleanupLog -Level ERROR -Message "Failed to clean Chrome print cache in ${prefPath}: $($_.Exception.Message)"
+        Catch {
+            Write-CleanupLog -Level ERROR -Message "Failed to clean Chrome print cache in ${PrefPath}: $($_.Exception.Message)";
         }
-    }
-}
+    };
+};
 
-# ---------------------------------------------------------------------------
-# 13. Restart services
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Restarting Services ==='
+#endregion Clear Chrome Print Preview Cache
 
-foreach ($svcName in @('Spooler', 'DeviceAssociationService')) {
-    Write-CleanupLog -Level INFO -Message "Starting: $svcName"
-    try {
-        Start-Service -Name $svcName -ErrorAction Stop
-        Write-CleanupLog -Level SUCCESS -Message "Started: $svcName"
-    }
-    catch {
-        Write-CleanupLog -Level ERROR -Message "Could not start ${svcName}: $($_.Exception.Message)"
-    }
-}
+#region Restart Services
 
-# ---------------------------------------------------------------------------
-Write-Host -ForegroundColor DarkCyan '=== Complete ==='
-Write-CleanupLog -Level SUCCESS -Message 'Cleanup complete. Reboot before retesting Add Device / printer discovery.'
+Write-Host -ForegroundColor DarkCyan '=== Restarting Services ===';
+
+ForEach ($ServiceName in @('Spooler', 'DeviceAssociationService')) {
+    Write-CleanupLog -Level INFO -Message "Starting: $ServiceName";
+
+    Try {
+        Start-Service -Name $ServiceName -ErrorAction Stop;
+
+        Write-CleanupLog -Level SUCCESS -Message "Started: $ServiceName";
+    }
+    Catch {
+        Write-CleanupLog -Level ERROR -Message "Could not start ${ServiceName}: $($_.Exception.Message)";
+    }
+};
+
+#endregion Restart Services
+
+#region Complete
+
+Write-Host -ForegroundColor DarkCyan '=== Complete ===';
+
+Write-CleanupLog -Level SUCCESS -Message 'Cleanup complete. Reboot before retesting Add Device or printer discovery.';
+
+#endregion Complete
