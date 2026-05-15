@@ -14,7 +14,8 @@
       7. Mount all local user hives, remove matched Printers\Connections keys, unmount
       8. Clear Client Side Rendering Print Provider cache (pattern + Servers)
       9. Clear Device Metadata filesystem caches
-     10. Restart services
+     10. Remove matched Chrome print preview cached destinations
+     11. Restart services
 .PARAMETER Patterns
     Strings to match against printer/device names, captions, port names, driver
     names, instance IDs, and registry key names. Matched against all relevant
@@ -361,7 +362,89 @@ foreach ($cachePath in $CachePaths) {
 }
 
 # ---------------------------------------------------------------------------
-# 10. Restart services
+# 10. Remove matched Chrome print preview cached destinations
+# ---------------------------------------------------------------------------
+Write-Host -ForegroundColor DarkCyan '=== Clearing Chrome Print Preview Cache ==='
+
+$ChromeProfiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue |
+Where-Object {
+    (-not $_.Special) -and
+    $_.LocalPath -and
+    ($_.LocalPath -like 'C:\Users\*')
+}
+
+foreach ($chromeUserProfile in $ChromeProfiles) {
+    $userPath = $chromeUserProfile.LocalPath
+    $chromeRoot = Join-Path -Path $userPath -ChildPath 'AppData\Local\Google\Chrome\User Data'
+
+    if (-not (Test-Path $chromeRoot)) {
+        Write-CleanupLog -Level INFO -Message "Chrome profile root not found for $userPath — skipping."
+        continue
+    }
+
+    $chromeProfileDirs = Get-ChildItem -Path $chromeRoot -Directory -ErrorAction SilentlyContinue |
+    Where-Object {
+        Test-Path (Join-Path -Path $_.FullName -ChildPath 'Preferences')
+    }
+
+    if (-not $chromeProfileDirs) {
+        Write-CleanupLog -Level INFO -Message "No Chrome Preferences files found for $userPath."
+        continue
+    }
+
+    foreach ($chromeProfileDir in $chromeProfileDirs) {
+        $prefPath = Join-Path -Path $chromeProfileDir.FullName -ChildPath 'Preferences'
+
+        try {
+            $prefs = Get-Content -Path $prefPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $sticky = $prefs.printing.print_preview_sticky_settings.appState
+
+            if (-not $sticky) {
+                Write-CleanupLog -Level INFO -Message "No Chrome print preview cache in $prefPath."
+                continue
+            }
+
+            $appState = $sticky | ConvertFrom-Json -ErrorAction Stop
+
+            if (-not $appState.recentDestinations) {
+                Write-CleanupLog -Level INFO -Message "No Chrome recent print destinations in $prefPath."
+                continue
+            }
+
+            $before = @($appState.recentDestinations).Count
+            $appState.recentDestinations = @(
+                $appState.recentDestinations | Where-Object {
+                    $text = "$($_.id) $($_.displayName)"
+                    -not (Test-MatchesPattern -Text $text -PatternList $Patterns)
+                }
+            )
+            $after = @($appState.recentDestinations).Count
+            $removed = $before - $after
+
+            if ($removed -le 0) {
+                Write-CleanupLog -Level INFO -Message "No matched Chrome print destinations in $prefPath."
+                continue
+            }
+
+            Copy-Item -Path $prefPath -Destination "$prefPath.bak" -Force -ErrorAction Stop
+
+            $prefs.printing.print_preview_sticky_settings.appState =
+            ($appState | ConvertTo-Json -Depth 20 -Compress)
+
+            $prefs |
+            ConvertTo-Json -Depth 100 -Compress |
+            Set-Content -Path $prefPath -Encoding UTF8 -ErrorAction Stop
+
+            Write-CleanupLog -Level SUCCESS -Message "Removed $removed Chrome print destination(s): $prefPath"
+        }
+        catch {
+            Write-CleanupLog -Level ERROR -Message "Failed to clean Chrome print cache in ${prefPath}: $($_.Exception.Message)"
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 11. Restart services
 # ---------------------------------------------------------------------------
 Write-Host -ForegroundColor DarkCyan '=== Restarting Services ==='
 
