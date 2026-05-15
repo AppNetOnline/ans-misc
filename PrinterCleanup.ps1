@@ -8,8 +8,8 @@
       1. Verify required device/RPC services are running
       2. Stop Spooler before printer object removals
       3. Remove matched printers (Remove-Printer + rundll32 PrintUIEntry)
-      4. Remove matched Win32_PnPEntity devices via pnputil
-      5. Remove matched Get-PnpDevice entries (PRINTENUM / SWD class)
+      4. Remove matched or phantom Win32_PnPEntity devices via pnputil
+      5. Remove matched or phantom Get-PnpDevice entries (PRINTENUM / SWD class)
       6. Remove matched PRINTENUM registry keys
       7. Remove matched machine-level Print\Connections registry keys
       8. Remove matched machine-level Print\Printers registry keys
@@ -272,16 +272,21 @@ Write-Host -ForegroundColor DarkCyan '=== Removing Stale PnP Printer Devices ===
 $MatchedPnpEntities = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue |
 Where-Object {
     $text = "$($_.Name) $($_.Caption) $($_.Description) $($_.PNPDeviceID)"
-    Test-MatchesPattern -Text $text -PatternList $Patterns
+    $isPrinterDevice = ($_.PNPClass -eq 'Printer') -or ($_.PNPDeviceID -like 'SWD\PRINTENUM\*')
+    $isPhantomDevice = $_.ConfigManagerErrorCode -eq 45
+
+    (Test-MatchesPattern -Text $text -PatternList $Patterns) -or
+    ($isPrinterDevice -and $isPhantomDevice)
 }
 
 if (-not $MatchedPnpEntities) {
-    Write-CleanupLog -Level INFO -Message 'No matching Win32_PnPEntity devices found.'
+    Write-CleanupLog -Level INFO -Message 'No matching or phantom Win32_PnPEntity devices found.'
 }
 else {
     foreach ($entity in $MatchedPnpEntities) {
         if ($entity.PNPDeviceID) {
-            Write-CleanupLog -Level WARN -Message "Removing PnP entity: $($entity.Name) [$($entity.PNPDeviceID)]"
+            $reason = if ($entity.ConfigManagerErrorCode -eq 45) { 'phantom' } else { 'matched' }
+            Write-CleanupLog -Level WARN -Message "Removing $reason PnP entity: $($entity.Name) [$($entity.PNPDeviceID)]"
             $result = pnputil.exe /remove-device "$($entity.PNPDeviceID)" /subtree /force
             Write-CleanupLog -Level INFO -Message "pnputil result: $result"
         }
@@ -296,15 +301,17 @@ Write-Host -ForegroundColor DarkCyan '=== Removing Stale PnpDevice Entries ==='
 $MatchedPnpDevices = Get-PnpDevice -Class Printer -ErrorAction SilentlyContinue |
 Where-Object {
     $text = "$($_.FriendlyName) $($_.Name) $($_.InstanceId)"
-    Test-MatchesPattern -Text $text -PatternList $Patterns
+    (Test-MatchesPattern -Text $text -PatternList $Patterns) -or
+    ($_.Problem -eq 'CM_PROB_PHANTOM')
 }
 
 if (-not $MatchedPnpDevices) {
-    Write-CleanupLog -Level INFO -Message 'No matching PnpDevice printer entries found.'
+    Write-CleanupLog -Level INFO -Message 'No matching or phantom PnpDevice printer entries found.'
 }
 else {
     foreach ($device in $MatchedPnpDevices) {
-        Write-CleanupLog -Level WARN -Message "Removing PnpDevice: $($device.FriendlyName) [$($device.InstanceId)]"
+        $reason = if ($device.Problem -eq 'CM_PROB_PHANTOM') { 'phantom' } else { 'matched' }
+        Write-CleanupLog -Level WARN -Message "Removing $reason PnpDevice: $($device.FriendlyName) [$($device.InstanceId)]"
         $result = pnputil.exe /remove-device "$($device.InstanceId)" /subtree /force
         Write-CleanupLog -Level INFO -Message "pnputil result: $result"
     }
