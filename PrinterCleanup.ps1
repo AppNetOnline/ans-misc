@@ -201,6 +201,40 @@ Function Remove-RegistryKeyIfPresent {
     }
 };
 
+Function Invoke-PnpDeviceRemoval {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstanceId,
+
+        [Parameter(Mandatory = $false)]
+        [string]$DisplayName = $InstanceId
+    )
+
+    Write-CleanupLog -Level WARN -Message "Removing PnP device: $DisplayName [$InstanceId]"
+
+    try {
+        $result = & pnputil.exe /remove-device $InstanceId /subtree /force 2>&1 | Out-String
+        $result = $result.Trim()
+
+        if ($result) {
+            Write-CleanupLog -Level INFO -Message "pnputil result: $result"
+        }
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-CleanupLog -Level SUCCESS -Message "pnputil removed device: $InstanceId"
+            return $true
+        }
+
+        Write-CleanupLog -Level WARN -Message "pnputil exit code $LASTEXITCODE for $InstanceId"
+    }
+    catch {
+        Write-CleanupLog -Level WARN -Message "pnputil failed for ${InstanceId}: $($_.Exception.Message)"
+    }
+
+    return $false
+};
+
 # ---------------------------------------------------------------------------
 # 1. Required services — verify and start if needed
 # ---------------------------------------------------------------------------
@@ -286,9 +320,7 @@ else {
     foreach ($entity in $MatchedPnpEntities) {
         if ($entity.PNPDeviceID) {
             $reason = if ($entity.ConfigManagerErrorCode -eq 45) { 'phantom' } else { 'matched' }
-            Write-CleanupLog -Level WARN -Message "Removing $reason PnP entity: $($entity.Name) [$($entity.PNPDeviceID)]"
-            $result = pnputil.exe /remove-device "$($entity.PNPDeviceID)" /subtree /force
-            Write-CleanupLog -Level INFO -Message "pnputil result: $result"
+            Invoke-PnpDeviceRemoval -InstanceId $entity.PNPDeviceID -DisplayName "$reason PnP entity: $($entity.Name)" | Out-Null
         }
     }
 }
@@ -311,9 +343,7 @@ if (-not $MatchedPnpDevices) {
 else {
     foreach ($device in $MatchedPnpDevices) {
         $reason = if ($device.Problem -eq 'CM_PROB_PHANTOM') { 'phantom' } else { 'matched' }
-        Write-CleanupLog -Level WARN -Message "Removing $reason PnpDevice: $($device.FriendlyName) [$($device.InstanceId)]"
-        $result = pnputil.exe /remove-device "$($device.InstanceId)" /subtree /force
-        Write-CleanupLog -Level INFO -Message "pnputil result: $result"
+        Invoke-PnpDeviceRemoval -InstanceId $device.InstanceId -DisplayName "$reason PnpDevice: $($device.FriendlyName)" | Out-Null
     }
 }
 
@@ -338,9 +368,19 @@ if (Test-Path $PrintEnumPath) {
         foreach ($key in $keysToRemove) {
             $instanceId = "SWD\PRINTENUM\$($key.PSChildName)"
             Write-CleanupLog -Level WARN -Message "Removing PRINTENUM key: $($key.Name)"
-            Write-CleanupLog -Level WARN -Message "Removing PRINTENUM PnP device: $instanceId"
-            $result = pnputil.exe /remove-device $instanceId /subtree /force
-            Write-CleanupLog -Level INFO -Message "pnputil result: $result"
+            $removedByPnp = Invoke-PnpDeviceRemoval -InstanceId $instanceId -DisplayName 'PRINTENUM registry device'
+
+            if (-not (Test-Path $key.PSPath)) {
+                Write-CleanupLog -Level INFO -Message "PRINTENUM key removed by PnP cleanup: $($key.Name)"
+                continue
+            }
+
+            if ($removedByPnp) {
+                Write-CleanupLog -Level WARN -Message "PRINTENUM key still visible after pnputil; leaving protected Enum key for Windows to reconcile: $($key.Name)"
+                continue
+            }
+
+            Write-CleanupLog -Level WARN -Message "pnputil did not remove PRINTENUM device; attempting registry fallback: $($key.Name)"
             Remove-RegistryKeyIfPresent -Path $key.PSPath -DisplayName $key.Name
         }
     }
